@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <code>v0.7.0</code>
+  <code>v0.7.1</code>
   &nbsp;·&nbsp;
   <code>Windows / macOS</code>
   &nbsp;·&nbsp;
@@ -17,7 +17,7 @@
 
 ![Codex Token Cost 主界面，项目、会话和正文已使用行级隐私遮罩](docs/images/codex-token-cost-overview.png)
 
-Codex Token Cost 是一个面向 Codex++ 的本地 userscript。它在 Codex 输入区上方展示本轮、当前会话、缓存命中、费用和今日累计，并提供独立使用统计、模型价格管理及本地 Profile 数据。
+Codex Token Cost 是一个面向 [Codex++](https://github.com/BigPizzaV3/CodexPlusPlus) 的本地 userscript。它在 Codex 输入区上方展示本轮、当前会话、缓存命中、费用和今日累计，并提供独立使用统计、模型价格管理及本地 Profile 数据。
 
 主脚本可独立运行。可选 helper 用于补充 CC Switch、Codex SQLite 会话数和 skill / plugin 统计。
 
@@ -221,4 +221,3 @@ tests/
 - 主脚本只写入 Codex WebView 的 `localStorage`。
 - helper 只读取本机 Codex session、Codex SQLite 和 CC Switch 数据。
 - 仓库不保存 API key、cookie、session token 或真实云端账号 ID。
-- README 截图中的项目、会话、任务标题、正文和命令内容均经过行级遮罩。

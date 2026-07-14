@@ -2,6 +2,9 @@
 
 !.gitignore
 !README.md
+!.github/
+!.github/workflows/
+!.github/workflows/release.yml
 !scripts/
 !scripts/codex-live-token-cost.js
 !scripts/codex-local-usage-helper.cjs

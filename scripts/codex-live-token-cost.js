@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.7.0
+// @version      0.7.1
 // @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "0.7.0";
+  const VERSION = "0.7.1";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -59,6 +59,7 @@
     "M11.9125 21.4125C11.5292 21.8625 11.0292 22.0958 10.4125 22.1125C9.79586 22.1291 9.29586 21.9208 8.91252 21.4875C8.53752 21.0541 8.45836 20.4541 8.67503 19.6875L9.68752 16H4.57502C4.00836 16 3.56669 15.8375 3.25002 15.5125C2.93336 15.1791 2.77502 14.7791 2.77502 14.3125C2.77502 13.8375 2.92919 13.4125 3.23752 13.0375L12.1375 2.47497C12.5209 2.02497 13.0209 1.79164 13.6375 1.77497C14.2542 1.75831 14.75 1.96664 15.125 2.39997C15.5084 2.83331 15.5917 3.43331 15.375 4.19997L14.3125 7.99998H19.425C19.9917 7.99998 20.4334 8.16664 20.75 8.49997C21.075 8.83331 21.2375 9.23748 21.2375 9.71247C21.2375 10.1791 21.0792 10.5958 20.7625 10.9625L11.9125 21.4125Z";
   const LEGACY_FAST_MODE_ICON_PATH_PREFIX = "M9.80999 17.8302C9.49666 18.1969";
   const RENDER_THROTTLE_MS = 250;
+  const SETTINGS_MODAL_EXIT_MS = 160;
   const PROFILE_SAVE_STATUS_DURATION_MS = 1800;
   const HELPER_STATS_URL = "http://127.0.0.1:17888/stats";
   const HELPER_STATS_REFRESH_URL = `${HELPER_STATS_URL}?refresh=1`;
@@ -213,6 +214,7 @@
     root: null,
     settingsButton: null,
     settingsOverlay: null,
+    settingsOverlayCloseTimer: 0,
     started: false,
     startedAt: Date.now(),
     renderTimer: 0,
@@ -300,6 +302,10 @@
     ccSwitchSyncPromise: null,
     ccSwitchStartupSyncStarted: false,
     ccSwitchSyncStatus: "",
+    settingsStatusPulseFrame: 0,
+    settingsFocusFrame: 0,
+    analyticsRangeSwitchFrame: 0,
+    analyticsRangeSwitchTimer: 0,
     hubValueCache: new Map(),
     hubSkeletonVersion: "",
     shimmerDelayTimer: 0,
@@ -1788,47 +1794,18 @@
       .filter((item) => normalizeUsage(item?.usage).exact && !isTransientSessionKey(turnSessionKey(item)));
     const retained = trimLocalLedger(exact);
     const retainedSet = new Set(retained);
-    const ccImportedAtByDate = new Map();
-    for (const turn of exact) {
-      const source = normalizeText(turn?.source, 80);
-      const importSource = normalizeText(turn?.importSource, 80);
-      if (source !== "cc-switch" && importSource !== "cc-switch") continue;
-      const date = localDateKey(turnTimestampMs(turn));
-      ccImportedAtByDate.set(date, Math.max(toCount(ccImportedAtByDate.get(date)), toCount(turn.importedAt || turn.observedAt || turn.createdAt)));
-    }
     const evicted = exact.filter((turn) => {
       const source = normalizeText(turn?.source, 80);
       const importSource = normalizeText(turn?.importSource, 80);
       return source !== "cc-switch" && importSource !== "cc-switch" && !retainedSet.has(turn);
     });
-    const uncovered = evicted.filter((turn) => {
-      const importedAt = toCount(ccImportedAtByDate.get(localDateKey(turnTimestampMs(turn))));
-      return !importedAt || turnTimestampMs(turn) >= importedAt;
-    });
     return {
       turns: retained,
-      archive: mergeLocalUsageArchive(archive, uncovered),
+      archive: mergeLocalUsageArchive(archive, evicted),
       evicted: evicted.length,
-      archived: uncovered.length,
-      dates: Array.from(new Set(uncovered.map((turn) => localDateKey(turnTimestampMs(turn))).filter(Boolean))),
+      archived: evicted.length,
+      dates: Array.from(new Set(evicted.map((turn) => localDateKey(turnTimestampMs(turn))).filter(Boolean))),
     };
-  }
-
-  function removeLocalUsageArchiveDates(dates) {
-    const targets = new Set((Array.isArray(dates) ? dates : [dates]).map((date) => normalizeText(date, 10)).filter(Boolean));
-    if (!targets.size) return false;
-    const archive = normalizeLocalUsageArchive(state.localUsageArchive);
-    let changed = false;
-    for (const date of targets) {
-      if (!archive.days[date]) continue;
-      delete archive.days[date];
-      changed = true;
-    }
-    if (changed) {
-      archive.updatedAt = Date.now();
-      state.localUsageArchive = archive;
-    }
-    return changed;
   }
 
   function importLocalUsageTurns(rows, options = {}) {
@@ -1840,7 +1817,6 @@
     const byId = new Map(existing.map((turn) => [turn.turnId, turn]));
     let imported = 0;
     let skipped = 0;
-    const importedDates = new Set();
     items.forEach((row, index) => {
       const turn = normalizeImportedUsageTurn(row, index, { importedAt });
       if (!turn) {
@@ -1848,13 +1824,11 @@
         return;
       }
       byId.set(turn.turnId, turn);
-      if (replaceSource === "cc-switch") importedDates.add(localDateKey(turnTimestampMs(turn)));
       imported++;
     });
     state.localLedger = Array.from(byId.values()).sort(
       (a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")) || String(a.turnId || "").localeCompare(String(b.turnId || "")),
     );
-    if (replaceSource === "cc-switch") removeLocalUsageArchiveDates(Array.from(importedDates));
     state.localLast = state.localLedger[state.localLedger.length - 1] || null;
     saveLocalLedger();
     if (replaceSource) rebuildAnalyticsRollup();
@@ -3388,21 +3362,38 @@
 
   function analyticsVisibleTurns(turns) {
     const items = (Array.isArray(turns) ? turns : []).filter((turn) => normalizeUsage(turn?.usage).exact);
-    const ccImportedAtByDate = new Map();
+    const groups = new Map();
     for (const turn of items) {
-      const source = normalizeText(turn?.source, 80);
-      const importSource = normalizeText(turn?.importSource, 80);
-      if (source !== "cc-switch" && importSource !== "cc-switch") continue;
       const date = localDateKey(turnTimestampMs(turn));
-      ccImportedAtByDate.set(date, Math.max(toTimestampMs(ccImportedAtByDate.get(date)), toTimestampMs(turn?.importedAt ?? turn?.observedAt ?? turn?.createdAt)));
-    }
-    return items.filter((turn) => {
+      const model = normalizeText(turn?.model, 120) || UNKNOWN_MODEL;
+      const key = `${date}\u0001${model}`;
       const source = normalizeText(turn?.source, 80);
       const importSource = normalizeText(turn?.importSource, 80);
-      if (source === "cc-switch" || importSource === "cc-switch" || source !== "codex-live-token-cost") return true;
-      const importedAt = toTimestampMs(ccImportedAtByDate.get(localDateKey(turnTimestampMs(turn))));
-      return !importedAt || turnTimestampMs(turn) >= importedAt;
-    });
+      const isCcSwitch = source === "cc-switch" || importSource === "cc-switch";
+      const group = groups.get(key) || {
+        local: [],
+        ccSwitch: [],
+        localBucket: emptyDailyUsageBucket(date),
+        ccBucket: emptyDailyUsageBucket(date),
+      };
+      if (isCcSwitch) {
+        group.ccSwitch.push(turn);
+        addTurnToDailyBucket(group.ccBucket, turn, normalizeUsage(turn.usage));
+      } else {
+        group.local.push(turn);
+        addTurnToDailyBucket(group.localBucket, turn, normalizeUsage(turn.usage));
+      }
+      groups.set(key, group);
+    }
+    const visible = items.slice(0, 0);
+    for (const group of groups.values()) {
+      if (group.ccSwitch.length && group.local.length) {
+        visible.push(...(group.ccBucket.tokens >= group.localBucket.tokens ? group.ccSwitch : group.local));
+      } else {
+        visible.push(...group.ccSwitch, ...group.local);
+      }
+    }
+    return visible;
   }
 
   function analyticsTurnTimestampMs(turn) {
@@ -3950,6 +3941,19 @@
     return target;
   }
 
+  function maxDailyBucket(target, source) {
+    const targetHasUsage = toCount(target?.tokens) > 0 || toCount(target?.input) > 0 || toCount(target?.output) > 0 || toCount(target?.cached) > 0;
+    const sourceWins = !targetHasUsage || toCount(source?.tokens) > toCount(target?.tokens) || Number(source?.cost) > Number(target?.cost);
+    target.tokens = Math.max(toCount(target.tokens), toCount(source?.tokens));
+    target.input = Math.max(toCount(target.input), toCount(source?.input));
+    target.output = Math.max(toCount(target.output), toCount(source?.output));
+    target.cached = Math.max(toCount(target.cached), toCount(source?.cached));
+    target.requests = Math.max(toCount(target.requests), toCount(source?.requests));
+    target.cost = Math.max(Number(target.cost) || 0, Number(source?.cost) || 0);
+    target.priced = sourceWins ? source?.priced !== false : target.priced !== false;
+    return target;
+  }
+
   function turnTimestampMs(turn) {
     const direct = toCount(turn?.observedAt || turn?.startedAt || turn?.finishedAt || turn?.createdAt);
     if (direct) return direct;
@@ -3958,11 +3962,8 @@
   }
 
   function localDailyUsage(options = {}) {
-    const includeLocalWithCcDates = Boolean(options.includeLocalWithCcDates);
     ensureLocalLedgerLoaded();
     const byDayModel = new Map();
-    const ccSwitchDates = new Set();
-    const ccSwitchImportedAtByDate = new Map();
     const ledgerTurnIds = new Set();
     for (const turn of [...localUsageArchiveTurns(), ...state.localLedger]) {
       const usage = normalizeUsage(turn?.usage);
@@ -3970,59 +3971,41 @@
       const turnId = normalizeText(turn?.turnId || turn?.id, 120);
       if (turnId) ledgerTurnIds.add(turnId);
       const date = localDateKey(turnTimestampMs(turn) || Date.now());
-      const model = normalizeText(turn.model || modelName(), 120).toLowerCase() || UNKNOWN_MODEL;
-      const key = `${date}\u0001${model}`;
+      const key = date;
       const source = normalizeText(turn.source, 80);
       const importSource = normalizeText(turn.importSource, 80);
       const isCcSwitch = source === "cc-switch" || importSource === "cc-switch";
-      if (isCcSwitch) {
-        ccSwitchDates.add(date);
-        ccSwitchImportedAtByDate.set(date, Math.max(toCount(ccSwitchImportedAtByDate.get(date)), toCount(turn.importedAt || turn.observedAt || turn.createdAt)));
-      }
       const group = byDayModel.get(key) || {
         date,
         local: emptyDailyUsageBucket(date),
         ccSwitch: emptyDailyUsageBucket(date),
-        other: emptyDailyUsageBucket(date),
-        localTurns: [],
       };
       if (isCcSwitch) addTurnToDailyBucket(group.ccSwitch, turn, usage);
-      else if (source === "codex-live-token-cost") {
-        addTurnToDailyBucket(group.local, turn, usage);
-        group.localTurns.push({ turn, usage });
-      }
-      else addTurnToDailyBucket(group.other, turn, usage);
+      else addTurnToDailyBucket(group.local, turn, usage);
+      byDayModel.set(key, group);
+    }
+
+    const currentMetric = localTurnMetric(localCurrentTurn(currentSessionKey()));
+    if (currentMetric && !ledgerTurnIds.has(currentMetric.turnId)) {
+      const date = localDateKey(turnTimestampMs(currentMetric) || Date.now());
+      const key = date;
+      const group = byDayModel.get(key) || {
+        date,
+        local: emptyDailyUsageBucket(date),
+        ccSwitch: emptyDailyUsageBucket(date),
+      };
+      addTurnToDailyBucket(group.local, currentMetric, normalizeUsage(currentMetric.usage));
       byDayModel.set(key, group);
     }
 
     const days = new Map();
     for (const group of byDayModel.values()) {
       const prev = days.get(group.date) || emptyDailyUsageBucket(group.date);
-      if (ccSwitchDates.has(group.date)) {
-        addDailyBucket(prev, group.ccSwitch);
-        if (includeLocalWithCcDates) addDailyBucket(prev, group.local);
-        else {
-          const importedAt = toCount(ccSwitchImportedAtByDate.get(group.date));
-          for (const item of group.localTurns) {
-            if (importedAt && turnTimestampMs(item.turn) < importedAt) continue;
-            addTurnToDailyBucket(prev, item.turn, item.usage);
-          }
-        }
-      } else {
-        addDailyBucket(prev, group.local);
-      }
-      addDailyBucket(prev, group.other);
+      const merged = emptyDailyUsageBucket(group.date);
+      maxDailyBucket(merged, group.local);
+      maxDailyBucket(merged, group.ccSwitch);
+      addDailyBucket(prev, merged);
       days.set(group.date, prev);
-    }
-    const currentMetric = localTurnMetric(localCurrentTurn(currentSessionKey()));
-    if (currentMetric && !ledgerTurnIds.has(currentMetric.turnId)) {
-      const date = localDateKey(turnTimestampMs(currentMetric) || Date.now());
-      const bucket = days.get(date) || emptyDailyUsageBucket(date);
-      const importedAt = toCount(ccSwitchImportedAtByDate.get(date));
-      if (includeLocalWithCcDates || !ccSwitchDates.has(date) || !importedAt || turnTimestampMs(currentMetric) >= importedAt) {
-        addTurnToDailyBucket(bucket, currentMetric, normalizeUsage(currentMetric.usage));
-        days.set(date, bucket);
-      }
     }
     return days;
   }
@@ -4931,7 +4914,17 @@
     state.priceEditorModel = modelName();
     void pollLocalHelperStats();
     render(true);
+    const focusModal = () => state.settingsOverlay?.querySelector("[data-action='close-price']")?.focus?.();
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(focusModal);
+    else focusModal();
     if (state.settingsPanel === "usage") void refreshUsageAnalyticsFromHelper();
+  }
+
+  function closeSettingsEditor() {
+    state.priceEditorOpen = false;
+    state.analyticsModel = "";
+    state.analyticsModelsExpanded = false;
+    render(true);
   }
 
   function headerSettingsLabel(snap = null) {
@@ -4949,13 +4942,13 @@
 
   function ensureHeaderSettingsButton(doc = document) {
     ensureStyle();
+    const existingButton = doc.getElementById?.(SETTINGS_BUTTON_ID);
+    if (!state.settingsButton && existingButton?.id === SETTINGS_BUTTON_ID) state.settingsButton = existingButton;
+    if (state.settingsButton && state.settingsButton.id !== SETTINGS_BUTTON_ID) state.settingsButton = null;
     const menu = findCodexPlusMenu(doc);
     if (!menu?.parentElement) {
-      state.settingsButton?.remove?.();
-      state.settingsButton = null;
-      return null;
+      return state.settingsButton || (existingButton?.id === SETTINGS_BUTTON_ID ? existingButton : null);
     }
-    const existingButton = doc.getElementById?.(SETTINGS_BUTTON_ID);
     if (existingButton && existingButton !== state.settingsButton) existingButton.remove?.();
     if (!state.settingsButton) {
       const button = doc.createElement("button");
@@ -4972,6 +4965,7 @@
       });
       state.settingsButton = button;
     }
+    if (!state.settingsButton.style) state.settingsButton.style = {};
     const menuRect = menu.getBoundingClientRect?.();
     const floating = menu.parentElement === doc.documentElement || menu.parentElement === doc.body || /codex-plus-menu-floating/i.test(String(menu.className || ""));
     const setFloating = (value) => {
@@ -5355,12 +5349,39 @@
         opacity: 0;
         transform: translateY(4px) scale(.97);
       }
+      .cltc-settings-overlay[data-cltc-closing="true"] {
+        pointer-events: none;
+      }
+      .cltc-settings-overlay[data-cltc-closing="true"] .cltc-settings-modal {
+        opacity: 0;
+        transform: translateY(2px) scale(.98);
+        transition: opacity var(--cltc-duration-press) var(--cltc-ease-out),
+          transform var(--cltc-duration-press) var(--cltc-ease-out);
+      }
+      .cltc-settings-overlay .cltc-settings-content {
+        transition: opacity var(--cltc-duration-popover) var(--cltc-ease-out),
+          transform var(--cltc-duration-popover) var(--cltc-ease-out);
+      }
+      .cltc-settings-overlay .cltc-settings-content[data-cltc-switching="true"] {
+        opacity: .45;
+        transform: translateY(4px);
+      }
       @media (prefers-reduced-motion: reduce) {
         .cltc-settings-modal {
           transform: none;
           transition: opacity var(--cltc-duration-press) var(--cltc-ease-out);
         }
         .cltc-settings-overlay[data-cltc-entering="true"] .cltc-settings-modal {
+          transform: none;
+        }
+        .cltc-settings-overlay[data-cltc-closing="true"] .cltc-settings-modal {
+          transform: none;
+          transition: opacity var(--cltc-duration-press) var(--cltc-ease-out);
+        }
+        .cltc-settings-overlay .cltc-settings-content {
+          transition: opacity var(--cltc-duration-press) var(--cltc-ease-out);
+        }
+        .cltc-settings-overlay .cltc-settings-content[data-cltc-switching="true"] {
           transform: none;
         }
       }
@@ -5407,9 +5428,7 @@
         cursor: pointer;
         font: 20px/1 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
-      #${ROOT_ID} .cltc-price-head button:hover,
       #${ROOT_ID} .cltc-price-head button:focus-visible,
-      .cltc-settings-overlay .cltc-price-head button:hover,
       .cltc-settings-overlay .cltc-price-head button:focus-visible {
         background: var(--cltc-hover);
         outline: none;
@@ -5419,7 +5438,23 @@
       #${ROOT_ID} .cltc-price-actions button,
       .cltc-settings-overlay button,
       .cltc-header-settings {
-        transition: transform var(--cltc-duration-press) var(--cltc-ease-out);
+        transition: transform var(--cltc-duration-press) var(--cltc-ease-out),
+          background var(--cltc-duration-press) var(--cltc-ease-out),
+          color var(--cltc-duration-press) var(--cltc-ease-out),
+          border-color var(--cltc-duration-press) var(--cltc-ease-out);
+      }
+      .cltc-settings-overlay .cltc-settings-nav button,
+      .cltc-settings-overlay .cltc-price-row {
+        transition: transform var(--cltc-duration-press) var(--cltc-ease-out),
+          background var(--cltc-duration-press) var(--cltc-ease-out),
+          color var(--cltc-duration-press) var(--cltc-ease-out),
+          border-color var(--cltc-duration-press) var(--cltc-ease-out);
+      }
+      .cltc-settings-overlay .cltc-profile-select,
+      .cltc-settings-overlay .cltc-price-input {
+        transition: background var(--cltc-duration-press) var(--cltc-ease-out),
+          color var(--cltc-duration-press) var(--cltc-ease-out),
+          border-color var(--cltc-duration-press) var(--cltc-ease-out);
       }
       #${ROOT_ID} .cltc-button:active,
       #${ROOT_ID} .cltc-price-head button:active,
@@ -5474,7 +5509,6 @@
         font: inherit;
         text-align: left;
       }
-      .cltc-settings-overlay .cltc-settings-nav button:hover,
       .cltc-settings-overlay .cltc-settings-nav button:focus-visible,
       .cltc-settings-overlay .cltc-settings-nav button[data-active="true"] {
         background: var(--cltc-hover);
@@ -5553,6 +5587,12 @@
       #${ROOT_ID} .cltc-sync-status[data-helper-unavailable="true"],
       .cltc-settings-overlay .cltc-sync-status[data-helper-unavailable="true"] {
         color: color-mix(in srgb, #b45309 75%, var(--cltc-text));
+      }
+      .cltc-settings-overlay .cltc-sync-status {
+        transition: opacity var(--cltc-duration-tooltip) var(--cltc-ease-out);
+      }
+      .cltc-settings-overlay .cltc-sync-status[data-cltc-status-pulse="true"] {
+        opacity: .48;
       }
       .cltc-settings-overlay .cltc-profile-save-toast {
         position: fixed;
@@ -5682,7 +5722,9 @@
         border-radius: 999px;
         background: var(--cltc-surface-secondary);
         cursor: pointer;
-        transition: background var(--cltc-duration-press) var(--cltc-ease-out), border-color var(--cltc-duration-press) var(--cltc-ease-out);
+        transition: transform var(--cltc-duration-press) var(--cltc-ease-out),
+          background var(--cltc-duration-press) var(--cltc-ease-out),
+          border-color var(--cltc-duration-press) var(--cltc-ease-out);
       }
       #${ROOT_ID} .cltc-toggle-field input::after,
       .cltc-settings-overlay .cltc-toggle-field input::after {
@@ -5705,6 +5747,10 @@
       #${ROOT_ID} .cltc-toggle-field input:checked::after,
       .cltc-settings-overlay .cltc-toggle-field input:checked::after {
         transform: translateX(14px);
+      }
+      #${ROOT_ID} .cltc-toggle-field input:active,
+      .cltc-settings-overlay .cltc-toggle-field input:active {
+        transform: scale(.97);
       }
       #${ROOT_ID} .cltc-toggle-field input:focus-visible,
       .cltc-settings-overlay .cltc-toggle-field input:focus-visible {
@@ -5758,8 +5804,6 @@
       .cltc-settings-overlay .cltc-profile-select:open::picker-icon {
         rotate: 180deg;
       }
-      #${ROOT_ID} .cltc-profile-select:hover,
-      .cltc-settings-overlay .cltc-profile-select:hover,
       #${ROOT_ID} .cltc-profile-select:open,
       .cltc-settings-overlay .cltc-profile-select:open {
         border-color: color-mix(in srgb, var(--cltc-text) 52%, var(--cltc-border));
@@ -5773,10 +5817,8 @@
         background: var(--cltc-popover);
         color: var(--cltc-text);
       }
-      #${ROOT_ID} .cltc-profile-select option:hover,
       #${ROOT_ID} .cltc-profile-select option:focus,
       #${ROOT_ID} .cltc-profile-select option:checked,
-      .cltc-settings-overlay .cltc-profile-select option:hover,
       .cltc-settings-overlay .cltc-profile-select option:focus,
       .cltc-settings-overlay .cltc-profile-select option:checked {
         background: var(--cltc-hover);
@@ -5820,23 +5862,10 @@
         font: inherit;
         text-decoration: none;
       }
-      #${ROOT_ID} .cltc-price-actions button:hover,
-      #${ROOT_ID} .cltc-price-actions .cltc-link-button:hover,
-      #${ROOT_ID} .cltc-price-row:hover,
-      .cltc-settings-overlay .cltc-price-actions button:hover,
-      .cltc-settings-overlay .cltc-price-actions .cltc-link-button:hover,
-      .cltc-settings-overlay .cltc-settings-row button:hover,
-      .cltc-settings-overlay .cltc-settings-row .cltc-link-button:hover,
-      .cltc-settings-overlay .cltc-price-row:hover {
-        background: var(--cltc-hover);
-      }
       .cltc-settings-overlay button[data-variant="primary"] {
         border-color: var(--cltc-primary);
         background: var(--cltc-primary);
         color: var(--cltc-primary-text);
-      }
-      .cltc-settings-overlay button[data-variant="primary"]:hover {
-        background: color-mix(in srgb, var(--cltc-primary) 88%, transparent);
       }
       .cltc-settings-overlay button[data-variant="danger"] {
         color: var(--cltc-danger);
@@ -5882,10 +5911,14 @@
         cursor: pointer;
         font: inherit;
       }
-      .cltc-settings-overlay .cltc-segmented button:hover,
+      .cltc-settings-overlay .cltc-segmented button {
+        transition: transform var(--cltc-duration-press) var(--cltc-ease-out),
+          opacity var(--cltc-duration-press) var(--cltc-ease-out),
+          background var(--cltc-duration-press) var(--cltc-ease-out),
+          color var(--cltc-duration-press) var(--cltc-ease-out);
+      }
       .cltc-settings-overlay .cltc-segmented button:focus-visible,
       .cltc-settings-overlay .cltc-segmented button[data-active="true"],
-      .cltc-settings-overlay .cltc-date-range-trigger:hover,
       .cltc-settings-overlay .cltc-date-range-trigger:focus-visible {
         background: var(--cltc-popover);
         color: var(--cltc-text);
@@ -5894,6 +5927,10 @@
       }
       .cltc-settings-overlay .cltc-segmented button[data-active="true"] {
         font-weight: 600;
+      }
+      .cltc-settings-overlay .cltc-segmented[data-cltc-range-switching="true"] button[data-active="true"] {
+        opacity: .72;
+        transform: translateY(2px);
       }
       .cltc-settings-overlay .cltc-segmented-compact button {
         min-width: 52px;
@@ -6103,7 +6140,6 @@
         font: inherit;
         text-align: left;
       }
-      .cltc-settings-overlay .cltc-analytics-model-row:hover,
       .cltc-settings-overlay .cltc-analytics-model-row:focus-visible {
         background: var(--cltc-hover);
         outline: none;
@@ -6128,6 +6164,46 @@
         color: var(--cltc-muted);
         font-size: 12px;
         text-align: center;
+      }
+      @media (hover: hover) and (pointer: fine) {
+        #${ROOT_ID} .cltc-price-head button:hover,
+        .cltc-settings-overlay .cltc-price-head button:hover,
+        #${ROOT_ID} .cltc-price-actions button:hover,
+        #${ROOT_ID} .cltc-price-actions .cltc-link-button:hover,
+        #${ROOT_ID} .cltc-price-row:hover,
+        .cltc-settings-overlay .cltc-price-actions button:hover,
+        .cltc-settings-overlay .cltc-price-actions .cltc-link-button:hover,
+        .cltc-settings-overlay .cltc-settings-row button:hover,
+        .cltc-settings-overlay .cltc-settings-row .cltc-link-button:hover,
+        .cltc-settings-overlay .cltc-price-row:hover,
+        .cltc-settings-overlay .cltc-analytics-model-row:hover,
+        .cltc-header-settings:hover {
+          background: var(--cltc-hover);
+        }
+        .cltc-settings-overlay .cltc-settings-nav button:hover {
+          background: var(--cltc-hover);
+          color: var(--cltc-text);
+          outline: none;
+        }
+        #${ROOT_ID} .cltc-profile-select:hover,
+        .cltc-settings-overlay .cltc-profile-select:hover {
+          border-color: color-mix(in srgb, var(--cltc-text) 52%, var(--cltc-border));
+          background: color-mix(in srgb, var(--cltc-surface-secondary) 70%, var(--cltc-input));
+        }
+        #${ROOT_ID} .cltc-profile-select option:hover,
+        .cltc-settings-overlay .cltc-profile-select option:hover {
+          background: var(--cltc-hover);
+        }
+        .cltc-settings-overlay button[data-variant="primary"]:hover {
+          background: color-mix(in srgb, var(--cltc-primary) 88%, transparent);
+        }
+        .cltc-settings-overlay .cltc-segmented button:hover,
+        .cltc-settings-overlay .cltc-date-range-trigger:hover {
+          background: var(--cltc-popover);
+          color: var(--cltc-text);
+          outline: none;
+          box-shadow: 0 1px 2px color-mix(in srgb, var(--cltc-shadow) 34%, transparent);
+        }
       }
       @media (max-width: 680px) {
         .cltc-settings-overlay {
@@ -6216,10 +6292,24 @@
         .cltc-settings-overlay .cltc-analytics-chart rect {
           transition: opacity var(--cltc-duration-tooltip) var(--cltc-ease-out);
         }
+        .cltc-settings-overlay .cltc-sync-status,
+        .cltc-settings-overlay .cltc-sync-status[data-cltc-status-pulse="true"] {
+          transition: none;
+          opacity: 1;
+        }
+        .cltc-settings-overlay .cltc-segmented[data-cltc-range-switching="true"] button[data-active="true"] {
+          transition: none;
+          opacity: 1;
+          transform: none;
+        }
         .cltc-settings-overlay .cltc-toggle-field input,
+        .cltc-settings-overlay .cltc-toggle-field input:active,
         .cltc-settings-overlay .cltc-toggle-field input::after,
+        .cltc-settings-overlay .cltc-profile-select,
+        .cltc-settings-overlay .cltc-price-input,
         .cltc-settings-overlay .cltc-profile-select::picker-icon {
           transition: none;
+          transform: none;
         }
         .cltc-settings-overlay .cltc-profile-save-toast {
           transform: translate(-50%, 0);
@@ -6256,7 +6346,6 @@
         z-index: 2147483647;
         margin-left: 0;
       }
-      .cltc-header-settings:hover,
       .cltc-header-settings:focus-visible {
         background: var(--cltc-hover);
         outline: none;
@@ -6297,10 +6386,7 @@
 
   function handleSettingsClick(event) {
     if (event.target?.classList?.contains("cltc-settings-overlay")) {
-      state.priceEditorOpen = false;
-      state.analyticsModel = "";
-      state.analyticsModelsExpanded = false;
-      render(true);
+      closeSettingsEditor();
       return;
     }
     const panelButton = event.target.closest?.("[data-settings-panel]");
@@ -6308,7 +6394,7 @@
       const panel = panelButton.getAttribute("data-settings-panel") || "";
       if (["profile", "general", "usage", "pricing"].includes(panel)) {
         state.settingsPanel = panel;
-        renderSettingsOverlay(liveSnapshot());
+        renderSettingsOverlay(liveSnapshot(), { animate: true });
         if (panel === "usage") void refreshUsageAnalyticsFromHelper();
       }
       return;
@@ -6316,7 +6402,7 @@
     const presetButton = event.target.closest?.("button[data-analytics-preset]");
     if (presetButton) {
       state.analyticsPreset = presetButton.getAttribute("data-analytics-preset") || "today";
-      renderSettingsOverlay(liveSnapshot());
+      renderSettingsOverlay(liveSnapshot(), { animate: true, analyticsRange: true });
       return;
     }
     if (event.target.closest?.("[data-action='open-analytics-calendar']")) {
@@ -6326,23 +6412,23 @@
     const metricButton = event.target.closest?.("[data-analytics-metric]");
     if (metricButton) {
       state.analyticsMetric = metricButton.getAttribute("data-analytics-metric") === "cost" ? "cost" : "tokens";
-      renderSettingsOverlay(liveSnapshot());
+      renderSettingsOverlay(liveSnapshot(), { animate: true });
       return;
     }
     const modelButton = event.target.closest?.("[data-analytics-model]");
     if (modelButton) {
       state.analyticsModel = modelButton.getAttribute("data-analytics-model") || "";
-      renderSettingsOverlay(liveSnapshot());
+      renderSettingsOverlay(liveSnapshot(), { animate: true });
       return;
     }
     if (event.target.closest?.("[data-action='clear-analytics-model']")) {
       state.analyticsModel = "";
-      renderSettingsOverlay(liveSnapshot());
+      renderSettingsOverlay(liveSnapshot(), { animate: true });
       return;
     }
     if (event.target.closest?.("[data-action='toggle-analytics-models']")) {
       state.analyticsModelsExpanded = !state.analyticsModelsExpanded;
-      renderSettingsOverlay(liveSnapshot());
+      renderSettingsOverlay(liveSnapshot(), { animate: true });
       return;
     }
     const picked = event.target.closest?.("[data-price-pick]");
@@ -6356,7 +6442,7 @@
     }
     if (picked) {
       state.priceEditorModel = picked.getAttribute("data-price-pick") || "";
-      renderSettingsOverlay(liveSnapshot());
+      renderSettingsOverlay(liveSnapshot(), { animate: true });
       return;
     }
     if (event.target.closest?.("[data-action='save-profile']")) {
@@ -6375,7 +6461,7 @@
     }
     if (event.target.closest?.("[data-action='reset-price']")) {
       restoreDefaultPrices();
-      renderSettingsOverlay(liveSnapshot());
+      renderSettingsOverlay(liveSnapshot(), { animate: true });
       return;
     }
     if (event.target.closest?.("[data-action='new-price']")) {
@@ -6383,10 +6469,7 @@
       return;
     }
     if (event.target.closest?.("[data-action='close-price']")) {
-      state.priceEditorOpen = false;
-      state.analyticsModel = "";
-      state.analyticsModelsExpanded = false;
-      render(true);
+      closeSettingsEditor();
       return;
     }
   }
@@ -6429,7 +6512,7 @@
     hidden.add(name);
     saveHiddenPriceModels(hidden);
     state.priceEditorModel = nextPriceEditorModel(modelName());
-    renderSettingsOverlay(liveSnapshot());
+    renderSettingsOverlay(liveSnapshot(), { animate: true });
     return true;
   }
 
@@ -6446,7 +6529,7 @@
 
   function startNewPriceModel() {
     state.priceEditorModel = newPriceModelName();
-    renderSettingsOverlay(liveSnapshot());
+    renderSettingsOverlay(liveSnapshot(), { animate: true });
   }
 
   function savePriceFromEditor() {
@@ -6533,7 +6616,27 @@
   function setCcSwitchSyncStatus(message) {
     state.ccSwitchSyncStatus = normalizeText(message, 160);
     const status = settingsEditorRoot()?.querySelector("[data-field='cc-switch-sync-status']");
-    if (status) status.textContent = state.ccSwitchSyncStatus;
+    if (!status) return;
+    status.textContent = state.ccSwitchSyncStatus;
+    pulseSettingsStatus(status);
+  }
+
+  function pulseSettingsStatus(node) {
+    if (!node) return;
+    if (state.settingsStatusPulseFrame) {
+      if (typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(state.settingsStatusPulseFrame);
+      state.settingsStatusPulseFrame = 0;
+    }
+    node.dataset.cltcStatusPulse = "true";
+    void node.offsetWidth;
+    if (typeof window.requestAnimationFrame !== "function") {
+      node.removeAttribute?.("data-cltc-status-pulse");
+      return;
+    }
+    state.settingsStatusPulseFrame = window.requestAnimationFrame(() => {
+      state.settingsStatusPulseFrame = 0;
+      node.removeAttribute?.("data-cltc-status-pulse");
+    });
   }
 
   async function syncCcSwitchFromSettings() {
@@ -6545,8 +6648,8 @@
       const imported = toCount(result.imported);
       const total = toCount(result.total ?? result.seen ?? result.rows);
       const suffix = total ? ` / ${fmtCount(total)} 条` : "";
-      setCcSwitchSyncStatus(`已同步 ${fmtCount(imported)} 条${suffix}`);
       renderSettingsOverlay(liveSnapshot());
+      setCcSwitchSyncStatus(`已同步 ${fmtCount(imported)} 条${suffix}`);
     } else if (result.skipped) {
       setCcSwitchSyncStatus(result.helperUnavailable ? "同步已跳过：helper 不可用，本地统计继续可用" : "同步已跳过：已有同步任务正在执行");
     } else if (result.helperUnavailable) {
@@ -7069,14 +7172,101 @@
     next?.focus?.();
   }
 
-  function renderSettingsOverlay(snap) {
-    if (!state.priceEditorOpen) {
-      destroyAnalyticsCalendar();
-      stopAnalyticsTimer();
-      state.settingsOverlay?.remove?.();
-      state.settingsOverlay = null;
+  function handleSettingsKeydown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault?.();
+      closeSettingsEditor();
       return;
     }
+    handleAnalyticsKeydown(event);
+  }
+
+  const SETTINGS_FOCUS_ATTRIBUTES = [
+    "data-settings-panel",
+    "data-price-pick",
+    "data-action",
+    "data-profile-field",
+    "data-price-field",
+    "data-analytics-preset",
+    "data-analytics-metric",
+    "data-analytics-model",
+    "data-chart-index",
+  ];
+  const SETTINGS_FOCUS_SELECTOR = SETTINGS_FOCUS_ATTRIBUTES.map((attribute) => `[${attribute}]`).join(",");
+
+  function settingsFocusKey(node, root) {
+    if (!node || !root?.contains?.(node)) return null;
+    const focusable = node.getAttribute ? node : node.closest?.(SETTINGS_FOCUS_SELECTOR);
+    if (!focusable) return null;
+    for (const attribute of SETTINGS_FOCUS_ATTRIBUTES) {
+      const value = focusable.getAttribute?.(attribute);
+      if (value != null) return { attribute, value };
+    }
+    return null;
+  }
+
+  function isSettingsFocusable(node) {
+    if (!node || node.disabled) return false;
+    const tabIndex = node.getAttribute?.("tabindex");
+    if (tabIndex != null) return Number(tabIndex) >= 0;
+    return /^(A|BUTTON|INPUT|SELECT|TEXTAREA)$/.test(String(node.tagName || ""));
+  }
+
+  function restoreSettingsFocus(root, key) {
+    if (!root || !key) return;
+    const target = Array.from(root.querySelectorAll?.(SETTINGS_FOCUS_SELECTOR) || []).find(
+      (node) => node.getAttribute?.(key.attribute) === key.value && isSettingsFocusable(node),
+    );
+    target?.focus?.();
+  }
+
+  function cancelSettingsFocusFrame() {
+    if (state.settingsFocusFrame && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(state.settingsFocusFrame);
+    }
+    state.settingsFocusFrame = 0;
+  }
+
+  function renderSettingsOverlay(snap, options = {}) {
+    const animate = options.animate === true;
+    const animateAnalyticsRange = options.analyticsRange === true;
+    if (state.analyticsRangeSwitchFrame) {
+      if (typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(state.analyticsRangeSwitchFrame);
+      state.analyticsRangeSwitchFrame = 0;
+    }
+    if (state.analyticsRangeSwitchTimer) {
+      window.clearTimeout(state.analyticsRangeSwitchTimer);
+      state.analyticsRangeSwitchTimer = 0;
+    }
+    if (!state.priceEditorOpen) {
+      cancelSettingsFocusFrame();
+      destroyAnalyticsCalendar();
+      stopAnalyticsTimer();
+      const overlay = state.settingsOverlay;
+      if (!overlay) return;
+      if (overlay.dataset.cltcClosing === "true") return;
+      const modal = overlay.querySelector?.(".cltc-settings-modal");
+      if (!modal) {
+        overlay.remove?.();
+        state.settingsOverlay = null;
+        return;
+      }
+      overlay.dataset.cltcClosing = "true";
+      const remove = () => {
+        state.settingsOverlayCloseTimer = 0;
+        if (state.priceEditorOpen || state.settingsOverlay !== overlay) return;
+        overlay.remove?.();
+        state.settingsOverlay = null;
+        state.settingsButton?.focus?.();
+      };
+      state.settingsOverlayCloseTimer = window.setTimeout(remove, SETTINGS_MODAL_EXIT_MS);
+      return;
+    }
+    if (state.settingsOverlayCloseTimer) {
+      window.clearTimeout(state.settingsOverlayCloseTimer);
+      state.settingsOverlayCloseTimer = 0;
+    }
+    state.settingsOverlay?.removeAttribute?.("data-cltc-closing");
     let entering = false;
     if (!state.settingsOverlay) {
       entering = true;
@@ -7086,7 +7276,7 @@
       state.settingsOverlay.dataset.cltcEntering = "true";
       state.settingsOverlay.addEventListener("click", handleSettingsClick);
       state.settingsOverlay.addEventListener("change", handleSettingsChange);
-      state.settingsOverlay.addEventListener("keydown", handleAnalyticsKeydown);
+      state.settingsOverlay.addEventListener("keydown", handleSettingsKeydown);
     }
     for (const node of Array.from(document.querySelectorAll?.(".cltc-settings-overlay") || [])) {
       if (node !== state.settingsOverlay) node.remove?.();
@@ -7099,6 +7289,7 @@
       else settle();
     }
     if (state.analyticsCalendar?.isOpen) return;
+    const focusKey = settingsFocusKey(document.activeElement, state.settingsOverlay);
     const contentScrollTop = state.settingsOverlay.querySelector(".cltc-settings-content")?.scrollTop || 0;
     const listScrollTop = state.settingsOverlay.querySelector(".cltc-price-list")?.scrollTop || 0;
     state.settingsOverlay.innerHTML = pricePopoverHtml(snap);
@@ -7106,6 +7297,47 @@
     const list = state.settingsOverlay.querySelector(".cltc-price-list");
     if (content) content.scrollTop = contentScrollTop;
     if (list) list.scrollTop = listScrollTop;
+    if (focusKey) cancelSettingsFocusFrame();
+    else if (
+      state.settingsFocusFrame &&
+      document.activeElement !== document.body &&
+      !state.settingsOverlay.contains?.(document.activeElement)
+    ) {
+      cancelSettingsFocusFrame();
+    }
+    restoreSettingsFocus(state.settingsOverlay, focusKey);
+    if (focusKey) {
+      const focusRoot = state.settingsOverlay;
+      const restoreFocus = () => {
+        state.settingsFocusFrame = 0;
+        if (state.settingsOverlay === focusRoot && focusRoot?.isConnected) restoreSettingsFocus(focusRoot, focusKey);
+      };
+      if (typeof window.requestAnimationFrame === "function") state.settingsFocusFrame = window.requestAnimationFrame(restoreFocus);
+      else restoreFocus();
+    }
+    if (animateAnalyticsRange) {
+      const rangeGroup = state.settingsOverlay.querySelector(".cltc-analytics-toolbar .cltc-segmented");
+      if (rangeGroup) {
+        const settle = () => {
+          state.analyticsRangeSwitchTimer = 0;
+          rangeGroup.removeAttribute("data-cltc-range-switching");
+        };
+        const activate = () => {
+          state.analyticsRangeSwitchFrame = 0;
+          rangeGroup.dataset.cltcRangeSwitching = "true";
+          void rangeGroup.offsetWidth;
+          state.analyticsRangeSwitchTimer = window.setTimeout(settle, SETTINGS_MODAL_EXIT_MS);
+        };
+        if (typeof window.requestAnimationFrame === "function") state.analyticsRangeSwitchFrame = window.requestAnimationFrame(activate);
+        else activate();
+      }
+    }
+    if (animate && content) {
+      content.dataset.cltcSwitching = "true";
+      const settle = () => content.removeAttribute("data-cltc-switching");
+      if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(settle);
+      else settle();
+    }
     syncAnalyticsTimer();
   }
 
@@ -7842,10 +8074,23 @@
     state.started = false;
     if (state.renderTimer) window.clearTimeout(state.renderTimer);
     if (state.profileSaveStatusTimer) window.clearTimeout(state.profileSaveStatusTimer);
+    if (state.settingsOverlayCloseTimer) window.clearTimeout(state.settingsOverlayCloseTimer);
+    if (state.settingsStatusPulseFrame && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(state.settingsStatusPulseFrame);
+    }
+    cancelSettingsFocusFrame();
+    if (state.analyticsRangeSwitchFrame && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(state.analyticsRangeSwitchFrame);
+    }
+    if (state.analyticsRangeSwitchTimer) window.clearTimeout(state.analyticsRangeSwitchTimer);
     if (state.profileIdentitySyncTimer) window.clearTimeout(state.profileIdentitySyncTimer);
     if (state.profileUsageRefreshTimer) window.clearTimeout(state.profileUsageRefreshTimer);
     if (state.hubVisibilityTimer) window.clearTimeout(state.hubVisibilityTimer);
     state.profileSaveStatusTimer = 0;
+    state.settingsOverlayCloseTimer = 0;
+    state.settingsStatusPulseFrame = 0;
+    state.analyticsRangeSwitchFrame = 0;
+    state.analyticsRangeSwitchTimer = 0;
     stopAnalyticsTimer();
     destroyAnalyticsCalendar();
     state.hubVisibilityObserver?.disconnect?.();

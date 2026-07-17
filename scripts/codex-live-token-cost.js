@@ -31,6 +31,7 @@
   const PROFILE_DEFAULTS_KEY = "__codexLiveTokenCostProfileDefaultsV1";
   const HUB_VISIBLE_KEY = "__codexLiveTokenCostHubVisibleV1";
   const PROFILE_UNLOCK_ENABLED_KEY = "__codexLiveTokenCostProfileUnlockEnabledV1";
+  let profileUnlockEnabledRuntime;
   const PROJECT_CONTEXT_ROW_SELECTOR =
     "[data-codex-composer-root] [data-composer-utility-bar-scroll-area] [data-composer-navigation-target='workspace-project']";
   const PROFILE_GATE_ID = "2478676115";
@@ -420,6 +421,7 @@
   }
 
   function profileUnlockEnabled() {
+    if (typeof profileUnlockEnabledRuntime === "boolean") return profileUnlockEnabledRuntime;
     try {
       return localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) !== "false";
     } catch {
@@ -428,12 +430,13 @@
   }
 
   function saveProfileUnlockEnabled(value) {
+    profileUnlockEnabledRuntime = Boolean(value);
     try {
-      localStorage.setItem(PROFILE_UNLOCK_ENABLED_KEY, value ? "true" : "false");
+      localStorage.setItem(PROFILE_UNLOCK_ENABLED_KEY, profileUnlockEnabledRuntime ? "true" : "false");
     } catch {
       // Keep the setting best-effort; the current runtime can still apply it.
     }
-    return value;
+    return profileUnlockEnabledRuntime;
   }
 
   function hasCodexProjectContextRow(doc = document) {
